@@ -1,477 +1,655 @@
-import re
-import os
-import sys
-import ssl
+import ast
 import json
-import socket
-import inspect
+import uuid
 import logging
 import traceback
+import six
 import requests
-from ssl import SSLError
-from flask_cors import CORS
-from requests.structures import CaseInsensitiveDict
+import xmltodict
+from flask import Response as FlaskResponse
 from requests.models import Response, Request
-from six import iteritems
-from six.moves.socketserver import ThreadingMixIn
-from six.moves.urllib.parse import urlparse
-from six.moves.BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
-from localstack.config import TMP_FOLDER, USE_SSL, EXTRA_CORS_ALLOWED_HEADERS, EXTRA_CORS_EXPOSE_HEADERS
-from localstack.constants import ENV_INTERNAL_TEST_RUN, APPLICATION_JSON
-from localstack.utils.common import FuncThread, generate_ssl_cert, to_bytes
-from localstack.utils.aws.aws_responses import LambdaResponse
-
-QUIET = False
-
-# path for test certificate
-SERVER_CERT_PEM_FILE = '%s/server.test.pem' % (TMP_FOLDER)
-
-
-CORS_ALLOWED_HEADERS = ['authorization', 'content-type', 'content-md5', 'cache-control',
-    'x-amz-content-sha256', 'x-amz-date', 'x-amz-security-token', 'x-amz-user-agent',
-    'x-amz-target', 'x-amz-acl', 'x-amz-version-id', 'x-localstack-target', 'x-amz-tagging']
-if EXTRA_CORS_ALLOWED_HEADERS:
-    CORS_ALLOWED_HEADERS += EXTRA_CORS_ALLOWED_HEADERS.split(',')
-
-CORS_ALLOWED_METHODS = ('HEAD', 'GET', 'PUT', 'POST', 'DELETE', 'OPTIONS', 'PATCH')
-
-CORS_EXPOSE_HEADERS = ('x-amz-version-id', )
-if EXTRA_CORS_EXPOSE_HEADERS:
-    CORS_EXPOSE_HEADERS += tuple(EXTRA_CORS_EXPOSE_HEADERS.split(','))
+from six.moves.urllib import parse as urlparse
+from localstack.config import external_service_url
+from localstack.constants import TEST_AWS_ACCOUNT_ID, MOTO_ACCOUNT_ID
+from localstack.services.awslambda import lambda_api
+from localstack.utils.analytics import event_publisher
+from localstack.utils.aws import aws_stack
+from localstack.utils.aws.aws_responses import response_regex_replace
+from localstack.utils.aws.dead_letter_queue import sns_error_to_dead_letter_queue
+from localstack.utils.common import timestamp_millis, short_uid, to_str
+from localstack.utils.persistence import PersistingProxyListener
 
 # set up logger
 LOG = logging.getLogger(__name__)
 
+# mappings for SNS topic subscriptions
+SNS_SUBSCRIPTIONS = {}
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handle each request in a separate thread."""
-    daemon_threads = True
+# mappings for subscription status
+SUBSCRIPTION_STATUS = {}
+
+# mappings for SNS tags
+SNS_TAGS = {}
 
 
-class ProxyListener(object):
+class ProxyListenerSNS(PersistingProxyListener):
+    def api_name(self):
+        return 'sns'
 
     def forward_request(self, method, path, data, headers):
-        """ This interceptor method is called by the proxy when receiving a new request
-            (*before* forwarding the request to the backend service). It receives details
-            of the incoming request, and returns either of the following results:
+        if method == 'OPTIONS':
+            return 200
 
-            * True if the request should be forwarded to the backend service as-is (default).
-            * An integer (e.g., 200) status code to return directly to the client without
-              calling the backend service.
-            * An instance of requests.models.Response to return directly to the client without
-              calling the backend service.
-            * An instance of requests.models.Request which represents a new/modified request
-              that will be forwarded to the backend service.
-            * Any other value, in which case a 503 Bad Gateway is returned to the client
-              without calling the backend service.
-        """
+        # check region
+        try:
+            aws_stack.check_valid_region(headers)
+            aws_stack.set_default_region_in_headers(headers)
+        except Exception as e:
+            return make_error(message=str(e), code=400)
+
+        if method == 'POST' and path == '/':
+            # parse payload and extract fields
+            req_data = urlparse.parse_qs(to_str(data), keep_blank_values=True)
+            req_action = req_data['Action'][0]
+            topic_arn = req_data.get('TargetArn') or req_data.get('TopicArn') or req_data.get('ResourceArn')
+
+            if topic_arn:
+                topic_arn = topic_arn[0]
+                topic_arn = aws_stack.fix_account_id_in_arns(topic_arn)
+
+            if req_action == 'SetSubscriptionAttributes':
+                sub = get_subscription_by_arn(req_data['SubscriptionArn'][0])
+                if not sub:
+                    return make_error(message='Unable to find subscription for given ARN', code=400)
+
+                attr_name = req_data['AttributeName'][0]
+                attr_value = req_data['AttributeValue'][0]
+                sub[attr_name] = attr_value
+                return make_response(req_action)
+
+            elif req_action == 'GetSubscriptionAttributes':
+                sub = get_subscription_by_arn(req_data['SubscriptionArn'][0])
+                if not sub:
+                    return make_error(message='Unable to find subscription for given ARN', code=400)
+
+                content = '<Attributes>'
+                for key, value in sub.items():
+                    content += '<entry><key>%s</key><value>%s</value></entry>\n' % (key, value)
+                content += '</Attributes>'
+                return make_response(req_action, content=content)
+
+            elif req_action == 'Subscribe':
+                if 'Endpoint' not in req_data:
+                    return make_error(message='Endpoint not specified in subscription', code=400)
+
+            elif req_action == 'ConfirmSubscription':
+                if 'TopicArn' not in req_data:
+                    return make_error(message='TopicArn not specified in confirm subscription request', code=400)
+
+                if 'Token' not in req_data:
+                    return make_error(message='Token not specified in confirm subscription request', code=400)
+
+                do_confirm_subscription(req_data.get('TopicArn')[0], req_data.get('Token')[0])
+
+            elif req_action == 'Unsubscribe':
+                if 'SubscriptionArn' not in req_data:
+                    return make_error(message='SubscriptionArn not specified in unsubscribe request', code=400)
+
+                do_unsubscribe(req_data.get('SubscriptionArn')[0])
+
+            elif req_action == 'DeleteTopic':
+                do_delete_topic(topic_arn)
+
+            elif req_action == 'Publish':
+                if req_data.get('Subject') == ['']:
+                    return make_error(code=400, code_string='InvalidParameter', message='Subject')
+
+                # No need to create a topic to send SMS or single push notifications with SNS
+                # but we can't mock a sending so we only return that it went well
+                if 'PhoneNumber' not in req_data and 'TargetArn' not in req_data:
+                    if topic_arn not in SNS_SUBSCRIPTIONS.keys():
+                        return make_error(code=404, code_string='NotFound', message='Topic does not exist')
+
+                publish_message(topic_arn, req_data)
+
+                # return response here because we do not want the request to be forwarded to SNS backend
+                return make_response(req_action)
+
+            elif req_action == 'ListTagsForResource':
+                tags = do_list_tags_for_resource(topic_arn)
+                content = '<Tags/>'
+                if len(tags) > 0:
+                    content = '<Tags>'
+                    for tag in tags:
+                        content += '<member>'
+                        content += '<Key>%s</Key>' % tag['Key']
+                        content += '<Value>%s</Value>' % tag['Value']
+                        content += '</member>'
+                    content += '</Tags>'
+                return make_response(req_action, content=content)
+
+            elif req_action == 'CreateTopic':
+                topic_arn = aws_stack.sns_topic_arn(req_data['Name'][0])
+                self._extract_tags(topic_arn, req_data)
+
+            elif req_action == 'TagResource':
+                self._extract_tags(topic_arn, req_data)
+                return make_response(req_action)
+
+            elif req_action == 'UntagResource':
+                tags_to_remove = []
+                req_tags = {k: v for k, v in req_data.items() if k.startswith('TagKeys.member.')}
+                req_tags = req_tags.values()
+                for tag in req_tags:
+                    tags_to_remove.append(tag[0])
+                do_untag_resource(topic_arn, tags_to_remove)
+                return make_response(req_action)
+
+            data = self._reset_account_id(data)
+            return Request(data=data, headers=headers, method=method)
+
         return True
 
-    def return_response(self, method, path, data, headers, response, request_handler=None):
-        """ This interceptor method is called by the proxy when returning a response
-            (*after* having forwarded the request and received a response from the backend
-            service). It receives details of the incoming request as well as the response
-            from the backend service, and returns either of the following results:
+    @staticmethod
+    def _extract_tags(topic_arn, req_data):
+        tags = []
+        req_tags = {k: v for k, v in req_data.items() if k.startswith('Tags.member.')}
+        for i in range(int(len(req_tags.keys()) / 2)):
+            key = req_tags['Tags.member.' + str(i + 1) + '.Key'][0]
+            value = req_tags['Tags.member.' + str(i + 1) + '.Value'][0]
+            tags.append({'Key': key, 'Value': value})
+        do_tag_resource(topic_arn, tags)
 
-            * An instance of requests.models.Response to return to the client instead of the
-              actual response returned from the backend service.
-            * Any other value, in which case the response from the backend service is
-              returned to the client.
-        """
-        return None
+    @staticmethod
+    def _reset_account_id(data):
+        """ Fix account ID in request payload. All external-facing responses contain our
+            predefined account ID (defaults to 000000000000), whereas the backend endpoint
+            from moto expects a different hardcoded account ID (123456789012). """
+        return aws_stack.fix_account_id_in_arns(
+            data, colon_delimiter='%3A', existing=TEST_AWS_ACCOUNT_ID, replace=MOTO_ACCOUNT_ID)
 
-    def get_forward_url(self, method, path, data, headers):
-        """ Return a custom URL to forward the given request to. If a falsy value is returned,
-            then the default URL will be used.
-        """
-        return None
+    def return_response(self, method, path, data, headers, response):
+        # persist requests to disk
+        super(ProxyListenerSNS, self).return_response(
+            method, path, data, headers, response
+        )
+
+        if method == 'POST' and path == '/':
+            # convert account IDs in ARNs
+            data = aws_stack.fix_account_id_in_arns(data, colon_delimiter='%3A')
+            aws_stack.fix_account_id_in_arns(response)
+
+            # remove "None" strings from result
+            search = r'<entry><key>[^<]+</key>\s*<value>\s*None\s*</[^>]+>\s*</entry>'
+            response_regex_replace(response, search, '')
+
+            # parse request and extract data
+            req_data = urlparse.parse_qs(to_str(data))
+            req_action = req_data['Action'][0]
+            if req_action == 'Subscribe' and response.status_code < 400:
+                response_data = xmltodict.parse(response.content)
+                topic_arn = (req_data.get('TargetArn') or req_data.get('TopicArn'))[0]
+                filter_policy = (req_data.get('FilterPolicy') or [None])[0]
+                attributes = get_subscribe_attributes(req_data)
+                sub_arn = response_data['SubscribeResponse']['SubscribeResult']['SubscriptionArn']
+                do_subscribe(
+                    topic_arn,
+                    req_data['Endpoint'][0],
+                    req_data['Protocol'][0],
+                    sub_arn,
+                    attributes,
+                    filter_policy
+                )
+            if req_action == 'CreateTopic' and response.status_code < 400:
+                response_data = xmltodict.parse(response.content)
+                topic_arn = response_data['CreateTopicResponse']['CreateTopicResult']['TopicArn']
+                do_create_topic(topic_arn)
+                # publish event
+                event_publisher.fire_event(
+                    event_publisher.EVENT_SNS_CREATE_TOPIC,
+                    payload={'t': event_publisher.get_hash(topic_arn)}
+                )
+            if req_action == 'DeleteTopic' and response.status_code < 400:
+                # publish event
+                topic_arn = (req_data.get('TargetArn') or req_data.get('TopicArn'))[0]
+                event_publisher.fire_event(
+                    event_publisher.EVENT_SNS_DELETE_TOPIC,
+                    payload={'t': event_publisher.get_hash(topic_arn)}
+                )
 
 
-class GenericProxyHandler(BaseHTTPRequestHandler):
+# instantiate listener
+UPDATE_SNS = ProxyListenerSNS()
 
-    # List of `ProxyListener` instances that are enabled by default for all requests
-    DEFAULT_LISTENERS = []
 
-    def __init__(self, request, client_address, server):
-        self.request = request
-        self.client_address = client_address
-        self.server = server
-        self.proxy = server.my_object
-        self.data_bytes = None
-        self.protocol_version = self.proxy.protocol_version
-        try:
-            BaseHTTPRequestHandler.__init__(self, request, client_address, server)
-        except SSLError as e:
-            LOG.warning('SSL error when handling request: %s' % e)
-        except Exception as e:
-            if 'cannot read from timed out object' not in str(e):
-                LOG.warning('Unknown error: %s' % e)
+def unsubscribe_sqs_queue(queue_url):
+    """ Called upon deletion of an SQS queue, to remove the queue from subscriptions """
+    for topic_arn, subscriptions in SNS_SUBSCRIPTIONS.items():
+        subscriptions = SNS_SUBSCRIPTIONS.get(topic_arn, [])
+        for subscriber in list(subscriptions):
+            sub_url = subscriber.get('sqs_queue_url') or subscriber['Endpoint']
+            if queue_url == sub_url:
+                subscriptions.remove(subscriber)
 
-    def parse_request(self):
-        result = BaseHTTPRequestHandler.parse_request(self)
-        if not result:
-            return result
-        if sys.version_info[0] >= 3:
-            return result
-        # Required fix for Python 2 (otherwise S3 uploads are hanging), based on the Python 3 code:
-        # https://sourcecodebrowser.com/python3.2/3.2.3/http_2server_8py_source.html#l00332
-        expect = self.headers.get('Expect', '')
-        if (expect.lower() == '100-continue' and
-                self.protocol_version >= 'HTTP/1.1' and
-                self.request_version >= 'HTTP/1.1'):
-            if self.request_version != 'HTTP/0.9':
-                self.wfile.write(('%s %d %s\r\n' %
-                    (self.protocol_version, 100, 'Continue')).encode('latin1', 'strict'))
-                self.end_headers()
-        return result
 
-    def do_GET(self):
-        self.method = requests.get
-        self.read_content()
-        self.forward('GET')
+def publish_message(topic_arn, req_data, subscription_arn=None):
+    message = req_data['Message'][0]
+    sqs_client = aws_stack.connect_to_service('sqs')
 
-    def do_PUT(self):
-        self.method = requests.put
-        self.read_content()
-        self.forward('PUT')
+    LOG.debug('Publishing message to TopicArn: %s | Message:  %s' % (topic_arn, message))
 
-    def do_POST(self):
-        self.method = requests.post
-        self.read_content()
-        self.forward('POST')
+    subscriptions = SNS_SUBSCRIPTIONS.get(topic_arn, [])
+    for subscriber in list(subscriptions):
+        if subscription_arn not in [None, subscriber['SubscriptionArn']]:
+            continue
+        filter_policy = json.loads(subscriber.get('FilterPolicy') or '{}')
+        message_attributes = get_message_attributes(req_data)
+        if not check_filter_policy(filter_policy, message_attributes):
+            continue
 
-    def do_DELETE(self):
-        self.data_bytes = None
-        self.method = requests.delete
-        self.forward('DELETE')
+        if subscriber['Protocol'] == 'sqs':
+            queue_url = None
+            try:
+                endpoint = subscriber['Endpoint']
+                if 'sqs_queue_url' in subscriber:
+                    queue_url = subscriber.get('sqs_queue_url')
+                elif '://' in endpoint:
+                    queue_url = endpoint
+                else:
+                    queue_name = endpoint.split(':')[5]
+                    queue_url = aws_stack.get_sqs_queue_url(queue_name)
+                    subscriber['sqs_queue_url'] = queue_url
 
-    def do_HEAD(self):
-        self.data_bytes = None
-        self.method = requests.head
-        self.forward('HEAD')
+                sqs_client.send_message(
+                    QueueUrl=queue_url,
+                    MessageBody=create_sns_message_body(subscriber, req_data),
+                    MessageAttributes=create_sqs_message_attributes(subscriber, message_attributes)
+                )
+            except Exception as exc:
+                sns_error_to_dead_letter_queue(subscriber['SubscriptionArn'], req_data, str(exc))
+                if 'NonExistentQueue' in str(exc):
+                    LOG.info('Removing non-existent queue "%s" subscribed to topic "%s"' % (queue_url, topic_arn))
+                    subscriptions.remove(subscriber)
 
-    def do_PATCH(self):
-        self.method = requests.patch
-        self.read_content()
-        self.forward('PATCH')
+        elif subscriber['Protocol'] == 'lambda':
+            try:
+                response = lambda_api.process_sns_notification(
+                    subscriber['Endpoint'],
+                    topic_arn,
+                    subscriber['SubscriptionArn'],
+                    message,
+                    message_attributes,
+                    subject=req_data.get('Subject', [None])[0]
+                )
+                if isinstance(response, FlaskResponse):
+                    response.raise_for_status()
+            except Exception as exc:
+                LOG.warning('Unable to run Lambda function on SNS message: %s %s' % (exc, traceback.format_exc()))
+                sns_error_to_dead_letter_queue(subscriber['SubscriptionArn'], req_data, str(exc))
 
-    def do_OPTIONS(self):
-        self.data_bytes = None
-        self.method = requests.options
-        self.forward('OPTIONS')
+        elif subscriber['Protocol'] in ['http', 'https']:
+            msg_type = (req_data.get('Type') or ['Notification'])[0]
+            try:
+                message_body = create_sns_message_body(subscriber, req_data)
+            except Exception:
+                continue
+            try:
+                response = requests.post(
+                    subscriber['Endpoint'],
+                    headers={
+                        'Content-Type': 'text/plain',
+                        # AWS headers according to
+                        # https://docs.aws.amazon.com/sns/latest/dg/sns-message-and-json-formats.html#http-header
+                        'x-amz-sns-message-type': msg_type,
+                        'x-amz-sns-topic-arn': subscriber['TopicArn'],
+                        'x-amz-sns-subscription-arn': subscriber['SubscriptionArn'],
+                        'User-Agent': 'Amazon Simple Notification Service Agent'
+                    },
+                    data=message_body,
+                    verify=False
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                sns_error_to_dead_letter_queue(subscriber['SubscriptionArn'], req_data, str(exc))
+        else:
+            LOG.warning('Unexpected protocol "%s" for SNS subscription' % subscriber['Protocol'])
 
-    def do_CONNECT(self):
-        self.method = None
-        self.headers['Connection'] = self.headers.get('Connection') or 'keep-alive'
-        self.forward('CONNECT')
 
-    def read_content(self):
-        content_length = self.headers.get('Content-Length')
-        if content_length:
-            self.data_bytes = self.rfile.read(int(content_length))
+def do_create_topic(topic_arn):
+    if topic_arn not in SNS_SUBSCRIPTIONS:
+        SNS_SUBSCRIPTIONS[topic_arn] = []
+
+
+def do_delete_topic(topic_arn):
+    SNS_SUBSCRIPTIONS.pop(topic_arn, None)
+
+
+def do_confirm_subscription(topic_arn, token):
+    for k, v in SUBSCRIPTION_STATUS.items():
+        if v['Token'] == token and v['TopicArn'] == topic_arn:
+            v['Status'] = 'Subscribed'
+
+
+def do_subscribe(topic_arn, endpoint, protocol, subscription_arn, attributes, filter_policy=None):
+    # An endpoint may only be subscribed to a topic once. Subsequent
+    # subscribe calls do nothing (subscribe is idempotent).
+    for existing_topic_subscription in SNS_SUBSCRIPTIONS.get(topic_arn, []):
+        if existing_topic_subscription.get('Endpoint') == endpoint:
             return
 
-        self.data_bytes = None
-        if self.method in (requests.post, requests.put):
-            LOG.warning('Expected Content-Length header not found in POST/PUT request')
+    subscription = {
+        # http://docs.aws.amazon.com/cli/latest/reference/sns/get-subscription-attributes.html
+        'TopicArn': topic_arn,
+        'Endpoint': endpoint,
+        'Protocol': protocol,
+        'SubscriptionArn': subscription_arn,
+        'FilterPolicy': filter_policy
+    }
+    subscription.update(attributes)
+    SNS_SUBSCRIPTIONS[topic_arn].append(subscription)
 
-            # If the Content-Length header is missing, try to read
-            # content from the socket using a socket timeout.
-            socket_timeout_secs = 0.5
-            self.request.settimeout(socket_timeout_secs)
-            block_length = 1
-            while True:
-                try:
-                    # TODO find a more efficient way to do this!
-                    tmp = self.rfile.read(block_length)
-                    if self.data_bytes is None:
-                        self.data_bytes = tmp
-                    else:
-                        self.data_bytes += tmp
-                except socket.timeout:
-                    break
+    if subscription_arn not in SUBSCRIPTION_STATUS.keys():
+        SUBSCRIPTION_STATUS[subscription_arn] = {}
 
-    def build_x_forwarded_for(self, headers):
-        x_forwarded_for = headers.get('X-Forwarded-For')
-
-        client_address = self.client_address[0]
-        server_address = ':'.join(map(str, self.server.server_address))
-
-        if x_forwarded_for:
-            x_forwarded_for_list = (x_forwarded_for, client_address, server_address)
-        else:
-            x_forwarded_for_list = (client_address, server_address)
-
-        return ', '.join(x_forwarded_for_list)
-
-    def forward(self, method):
-        data = self.data_bytes
-        forward_headers = CaseInsensitiveDict(self.headers)
-
-        # force close connection
-        connection_header = forward_headers.get('Connection') or ''
-        if connection_header.lower() not in ['keep-alive', '']:
-            self.close_connection = 1
-
-        def is_full_url(url):
-            return re.match(r'[a-zA-Z]+://.+', url)
-
-        path = self.path
-        if is_full_url(path):
-            path = path.split('://', 1)[1]
-            path = '/%s' % (path.split('/', 1)[1] if '/' in path else '')
-        forward_base_url = self.proxy.forward_base_url
-        proxy_url = '%s%s' % (forward_base_url, path)
-
-        for listener in self._listeners():
-            if listener:
-                proxy_url = listener.get_forward_url(method, path, data, forward_headers) or proxy_url
-
-        target_url = self.path
-        if not is_full_url(target_url):
-            target_url = '%s%s' % (forward_base_url, target_url)
-
-        # update original "Host" header (moto s3 relies on this behavior)
-        if not forward_headers.get('Host'):
-            forward_headers['host'] = urlparse(target_url).netloc
-        if 'localhost.atlassian.io' in forward_headers.get('Host'):
-            forward_headers['host'] = 'localhost'
-        forward_headers['X-Forwarded-For'] = self.build_x_forwarded_for(forward_headers)
-
-        try:
-            response = None
-            modified_request = None
-            # update listener (pre-invocation)
-            for listener in self._listeners():
-                if not listener:
-                    continue
-                listener_result = listener.forward_request(method=method,
-                    path=path, data=data, headers=forward_headers)
-                if isinstance(listener_result, Response):
-                    response = listener_result
-                    break
-                if isinstance(listener_result, LambdaResponse):
-                    response = listener_result
-                    break
-                if isinstance(listener_result, dict):
-                    response = Response()
-                    response._content = json.dumps(listener_result)
-                    response.headers['Content-Type'] = APPLICATION_JSON
-                    response.status_code = 200
-                    break
-                elif isinstance(listener_result, Request):
-                    modified_request = listener_result
-                    data = modified_request.data
-                    forward_headers = modified_request.headers
-                    break
-                elif listener_result is not True:
-                    # get status code from response, or use Bad Gateway status code
-                    code = listener_result if isinstance(listener_result, int) else 503
-                    self.send_response(code)
-                    self.send_header('Content-Length', '0')
-                    # allow pre-flight CORS headers by default
-                    self._send_cors_headers()
-                    self.end_headers()
-                    return
-
-            # perform the actual invocation of the backend service
-            if response is None:
-                forward_headers['Connection'] = connection_header or 'close'
-                data_to_send = self.data_bytes
-                request_url = proxy_url
-                if modified_request:
-                    if modified_request.url:
-                        request_url = '%s%s' % (forward_base_url, modified_request.url)
-                    data_to_send = modified_request.data
-
-                response = self.method(request_url, data=data_to_send,
-                    headers=forward_headers, stream=True)
-
-                # prevent requests from processing response body
-                if not response._content_consumed and response.raw:
-                    response._content = response.raw.read()
-
-            # update listener (post-invocation)
-            if self.proxy.update_listener:
-                kwargs = {
-                    'method': method,
-                    'path': path,
-                    'data': self.data_bytes,
-                    'headers': forward_headers,
-                    'response': response
-                }
-                if 'request_handler' in inspect.getargspec(self.proxy.update_listener.return_response)[0]:
-                    # some listeners (e.g., sqs_listener.py) require additional details like the original
-                    # request port, hence we pass in a reference to this request handler as well.
-                    kwargs['request_handler'] = self
-                updated_response = self.proxy.update_listener.return_response(**kwargs)
-                if isinstance(updated_response, Response):
-                    response = updated_response
-
-            # copy headers and return response
-            self.send_response(response.status_code)
-
-            content_length_sent = False
-            for header_key, header_value in iteritems(response.headers):
-                # filter out certain headers that we don't want to transmit
-                if header_key.lower() not in ('transfer-encoding', 'date', 'server'):
-                    self.send_header(header_key, header_value)
-                    content_length_sent = content_length_sent or header_key.lower() == 'content-length'
-
-            if not content_length_sent:
-                self.send_header('Content-Length', '%s' % len(response.content) if response.content else 0)
-
-            if isinstance(response, LambdaResponse):
-                self.send_multi_value_headers(response.multi_value_headers)
-
-            # allow pre-flight CORS headers by default
-            self._send_cors_headers(response)
-
-            self.end_headers()
-            if response.content and len(response.content):
-                self.wfile.write(to_bytes(response.content))
-        except Exception as e:
-            trace = str(traceback.format_exc())
-            conn_errors = ('ConnectionRefusedError', 'NewConnectionError',
-                           'Connection aborted', 'Unexpected EOF', 'Connection reset by peer',
-                           'cannot read from timed out object')
-            conn_error = any(e in trace for e in conn_errors)
-            error_msg = 'Error forwarding request: %s %s' % (e, trace)
-            if 'Broken pipe' in trace:
-                LOG.warn('Connection prematurely closed by client (broken pipe).')
-            elif not self.proxy.quiet or not conn_error:
-                LOG.error(error_msg)
-                if os.environ.get(ENV_INTERNAL_TEST_RUN):
-                    # During a test run, we also want to print error messages, because
-                    # log messages are delayed until the entire test run is over, and
-                    # hence we are missing messages if the test hangs for some reason.
-                    print('ERROR: %s' % error_msg)
-            self.send_response(502)  # bad gateway
-            self.end_headers()
-            # force close connection
-            self.close_connection = 1
-        finally:
-            try:
-                self.wfile.flush()
-            except Exception as e:
-                LOG.warning('Unable to flush write file: %s' % e)
-
-    def _send_cors_headers(self, response=None):
-        # Note: Use "response is not None" here instead of "not response"!
-        headers = response is not None and response.headers or {}
-        if 'Access-Control-Allow-Origin' not in headers:
-            self.send_header('Access-Control-Allow-Origin', '*')
-        if 'Access-Control-Allow-Methods' not in headers:
-            self.send_header('Access-Control-Allow-Methods', ','.join(CORS_ALLOWED_METHODS))
-        if 'Access-Control-Allow-Headers' not in headers:
-            requested_headers = self.headers.get('Access-Control-Request-Headers', '')
-            requested_headers = re.split(r'[,\s]+', requested_headers) + CORS_ALLOWED_HEADERS
-            self.send_header('Access-Control-Allow-Headers', ','.join([h for h in requested_headers if h]))
-        if 'Access-Control-Expose-Headers' not in headers:
-            self.send_header('Access-Control-Expose-Headers', ','.join(CORS_EXPOSE_HEADERS))
-
-    def _listeners(self):
-        return self.DEFAULT_LISTENERS + [self.proxy.update_listener]
-
-    def log_message(self, format, *args):
-        return
-
-    def send_multi_value_headers(self, multi_value_headers):
-        for key, values in multi_value_headers.items():
-            for value in values:
-                self.send_header(key, value)
+    SUBSCRIPTION_STATUS[subscription_arn].update(
+        {
+            'TopicArn': topic_arn,
+            'Token': short_uid(),
+            'Status': 'Not Subscribed'
+        }
+    )
+    # Send out confirmation message for HTTP(S), fix for https://github.com/localstack/localstack/issues/881
+    if protocol in ['http', 'https']:
+        token = short_uid()
+        external_url = external_service_url('sns')
+        confirmation = {
+            'Type': ['SubscriptionConfirmation'],
+            'Token': [token],
+            'Message': [('You have chosen to subscribe to the topic %s.\n' % topic_arn) +
+                        'To confirm the subscription, visit the SubscribeURL included in this message.'],
+            'SubscribeURL': ['%s/?Action=ConfirmSubscription&TopicArn=%s&Token=%s' % (external_url, topic_arn, token)]
+        }
+        publish_message(topic_arn, confirmation, subscription_arn)
 
 
-class DuplexSocket(ssl.SSLSocket):
-    """ Simple duplex socket wrapper that allows serving HTTP/HTTPS over the same port. """
-
-    def accept(self):
-        newsock, addr = socket.socket.accept(self)
-        peek_bytes = 5
-        first_bytes = newsock.recv(peek_bytes, socket.MSG_PEEK)
-        if len(first_bytes or '') == peek_bytes:
-            first_byte = first_bytes[0]
-            if first_byte < 32 or first_byte >= 127:
-                newsock = self.context.wrap_socket(newsock,
-                            do_handshake_on_connect=self.do_handshake_on_connect,
-                            suppress_ragged_eofs=self.suppress_ragged_eofs,
-                            server_side=True)
-
-        return newsock, addr
+def do_unsubscribe(subscription_arn):
+    for topic_arn in SNS_SUBSCRIPTIONS:
+        SNS_SUBSCRIPTIONS[topic_arn] = [
+            sub for sub in SNS_SUBSCRIPTIONS[topic_arn]
+            if sub['SubscriptionArn'] != subscription_arn
+        ]
 
 
-# set globally defined SSL socket implementation class
-ssl.SSLContext.sslsocket_class = DuplexSocket
+def _get_tags(topic_arn):
+    if topic_arn not in SNS_TAGS:
+        SNS_TAGS[topic_arn] = []
+
+    return SNS_TAGS[topic_arn]
 
 
-class GenericProxy(FuncThread):
-    def __init__(self, port, forward_url=None, ssl=False, host=None, update_listener=None, quiet=False, params={}):
-        FuncThread.__init__(self, self.run_cmd, params, quiet=quiet)
-        self.httpd = None
-        self.port = port
-        self.ssl = ssl
-        self.quiet = quiet
-        if forward_url:
-            if '://' not in forward_url:
-                forward_url = 'http://%s' % forward_url
-            forward_url = forward_url.rstrip('/')
-        self.forward_base_url = forward_url
-        self.update_listener = update_listener
-        self.server_stopped = False
-        # Required to enable 'Connection: keep-alive' for S3 uploads
-        self.protocol_version = params.get('protocol_version') or 'HTTP/1.1'
-        self.listen_host = host or ''
+def do_list_tags_for_resource(topic_arn):
+    return _get_tags(topic_arn)
 
-    def run_cmd(self, params):
-        try:
-            self.httpd = ThreadedHTTPServer((self.listen_host, self.port), GenericProxyHandler)
-            if self.ssl:
-                # make sure we have a cert generated
-                combined_file, cert_file_name, key_file_name = GenericProxy.create_ssl_cert(serial_number=self.port)
-                self.httpd.socket = ssl.wrap_socket(self.httpd.socket,
-                    server_side=True, certfile=combined_file)
-            self.httpd.my_object = self
-            self.httpd.serve_forever()
-        except Exception as e:
-            if not self.quiet or not self.server_stopped:
-                LOG.error('Exception running proxy on port %s: %s %s' % (self.port, e, traceback.format_exc()))
 
-    def stop(self, quiet=False):
-        self.quiet = quiet
-        if self.httpd:
-            self.httpd.server_close()
-            self.server_stopped = True
+def do_tag_resource(topic_arn, tags):
+    existing_tags = SNS_TAGS.get(topic_arn, [])
+    tags = [
+        tag for idx, tag in enumerate(tags)
+        if tag not in tags[:idx]
+    ]
 
-    @classmethod
-    def create_ssl_cert(cls, serial_number=None):
-        return generate_ssl_cert(SERVER_CERT_PEM_FILE, serial_number=serial_number)
-
-    @classmethod
-    def get_flask_ssl_context(cls, serial_number=None):
-        if USE_SSL:
-            _, cert_file_name, key_file_name = cls.create_ssl_cert(serial_number=serial_number)
-            return (cert_file_name, key_file_name)
+    def existing_tag_index(item):
+        for idx, tag in enumerate(existing_tags):
+            if item['Key'] == tag['Key']:
+                return idx
         return None
 
+    for item in tags:
+        existing_index = existing_tag_index(item)
+        if existing_index is None:
+            existing_tags.append(item)
+        else:
+            existing_tags[existing_index] = item
 
-def serve_flask_app(app, port, quiet=True, host=None, cors=True):
-    if cors:
-        CORS(app)
-    if quiet:
-        logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    if not host:
-        host = '0.0.0.0'
-    ssl_context = GenericProxy.get_flask_ssl_context(serial_number=port)
-    app.config['ENV'] = 'development'
+    SNS_TAGS[topic_arn] = existing_tags
 
-    def noecho(*args, **kwargs):
-        pass
 
+def do_untag_resource(topic_arn, tag_keys):
+    SNS_TAGS[topic_arn] = [t for t in _get_tags(topic_arn) if t['Key'] not in tag_keys]
+
+
+# ---------------
+# HELPER METHODS
+# ---------------
+
+
+def get_topic_by_arn(topic_arn):
+    return SNS_SUBSCRIPTIONS.get(topic_arn)
+
+
+def get_subscription_by_arn(sub_arn):
+    # TODO maintain separate map instead of traversing all items
+    for key, subscriptions in SNS_SUBSCRIPTIONS.items():
+        for sub in subscriptions:
+            if sub['SubscriptionArn'] == sub_arn:
+                return sub
+
+
+def make_response(op_name, content=''):
+    response = Response()
+    if not content:
+        content = '<MessageId>%s</MessageId>' % short_uid()
+    response._content = """<{op_name}Response xmlns="http://sns.amazonaws.com/doc/2010-03-31/">
+        <{op_name}Result>
+            {content}
+        </{op_name}Result>
+        <ResponseMetadata><RequestId>{req_id}</RequestId></ResponseMetadata>
+        </{op_name}Response>""".format(op_name=op_name, content=content, req_id=short_uid())
+    response.status_code = 200
+    return response
+
+
+# TODO move to utils!
+def make_error(message, code=400, code_string='InvalidParameter'):
+    response = Response()
+    response._content = """<ErrorResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/"><Error>
+        <Type>Sender</Type>
+        <Code>{code_string}</Code>
+        <Message>{message}</Message>
+        </Error><RequestId>{req_id}</RequestId>
+        </ErrorResponse>""".format(message=message, code_string=code_string, req_id=short_uid())
+    response.status_code = code
+    return response
+
+
+def create_sns_message_body(subscriber, req_data):
+    message = req_data['Message'][0]
+    subject = req_data.get('Subject', [None])[0]
+    protocol = subscriber['Protocol']
+
+    if six.PY2 and type(message).__name__ == 'unicode':
+        # fix non-ascii unicode characters under Python 2
+        message = message.encode('raw-unicode-escape')
+
+    if is_raw_message_delivery(subscriber):
+        return message
+
+    if req_data.get('MessageStructure') == ['json']:
+        message = json.loads(message)
+        try:
+            message = message.get(protocol, message['default'])
+        except KeyError:
+            raise Exception("Unable to find 'default' key in message payload")
+
+    data = {
+        'Type': req_data.get('Type', ['Notification'])[0],
+        'MessageId': str(uuid.uuid4()),
+        'Token': req_data.get('Token', [None])[0],
+        'TopicArn': subscriber['TopicArn'],
+        'Message': message,
+        'SubscribeURL': req_data.get('SubscribeURL', [None])[0],
+        'Timestamp': timestamp_millis(),
+        'SignatureVersion': '1',
+        # TODO Add a more sophisticated solution with an actual signature
+        # Hardcoded
+        'Signature': 'EXAMPLEpH+..',
+        'SigningCertURL': 'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-0000000000000000000000.pem'
+    }
+
+    if subject is not None:
+        data['Subject'] = subject
+
+    attributes = get_message_attributes(req_data)
+    if attributes:
+        data['MessageAttributes'] = attributes
+
+    return json.dumps(data)
+
+
+def create_sqs_message_attributes(subscriber, attributes):
+    if not is_raw_message_delivery(subscriber):
+        return {}
+
+    message_attributes = {}
+    for key, value in attributes.items():
+        attribute = {
+            'DataType': value['Type']
+        }
+        if value['Type'] == 'Binary':
+            attribute['BinaryValue'] = value['Value']
+        else:
+            attribute['StringValue'] = str(value['Value'])
+
+        message_attributes[key] = attribute
+
+    return message_attributes
+
+
+def get_message_attributes(req_data):
+    attributes = {}
+    x = 1
+    while True:
+        name = req_data.get('MessageAttributes.entry.' + str(x) + '.Name', [None])[0]
+        if name is not None:
+            attribute = {
+                'Type': req_data.get('MessageAttributes.entry.' + str(x) + '.Value.DataType', [None])[0]
+            }
+            string_value = req_data.get('MessageAttributes.entry.' + str(x) + '.Value.StringValue', [None])[0]
+            binary_value = req_data.get('MessageAttributes.entry.' + str(x) + '.Value.BinaryValue', [None])[0]
+            if string_value is not None:
+                attribute['Value'] = string_value
+            elif binary_value is not None:
+                attribute['Value'] = binary_value
+
+            attributes[name] = attribute
+            x += 1
+        else:
+            break
+
+    return attributes
+
+
+def get_subscribe_attributes(req_data):
+    attributes = {}
+    for key in req_data.keys():
+        if '.key' in key:
+            attributes[req_data[key][0]] = req_data[key.replace('key', 'value')][0]
+    return attributes
+
+
+def is_number(x):
     try:
-        import click
-        click.echo = noecho
-    except Exception:
-        pass
+        float(x)
+        return True
+    except ValueError:
+        return False
 
-    app.run(port=int(port), threaded=True, host=host, ssl_context=ssl_context)
-    return app
+
+def evaluate_numeric_condition(conditions, value):
+    if not is_number(value):
+        return False
+
+    for i in range(0, len(conditions), 2):
+        value = float(value)
+        operator = conditions[i]
+        operand = float(conditions[i + 1])
+
+        if operator == '=':
+            if value != operand:
+                return False
+        elif operator == '>':
+            if value <= operand:
+                return False
+        elif operator == '<':
+            if value >= operand:
+                return False
+        elif operator == '>=':
+            if value < operand:
+                return False
+        elif operator == '<=':
+            if value > operand:
+                return False
+
+    return True
+
+
+def evaluate_exists_condition(conditions, message_attributes, criteria):
+    # filtering should not match any messages if the exists is set to false,As per aws docs
+    # https://docs.aws.amazon.com/sns/latest/dg/sns-subscription-filter-policies.html
+    if conditions:
+        return bool(message_attributes.get(criteria))
+    return False
+
+
+def evaluate_condition(value, condition, message_attributes, criteria):
+    if type(condition) is not dict:
+        return value == condition
+    elif condition.get('anything-but'):
+        return value not in condition.get('anything-but')
+    elif condition.get('prefix'):
+        prefix = condition.get('prefix')
+        return value.startswith(prefix)
+    elif condition.get('numeric'):
+        return evaluate_numeric_condition(condition.get('numeric'), value)
+    elif condition.get('exists'):
+        return evaluate_exists_condition(condition.get('exists'), message_attributes, criteria)
+
+    return False
+
+
+def evaluate_filter_policy_conditions(conditions, attribute, message_attributes, criteria):
+    if type(conditions) is not list:
+        conditions = [conditions]
+
+    if attribute['Type'] == 'String.Array':
+        values = ast.literal_eval(attribute['Value'])
+        for value in values:
+            for condition in conditions:
+                if evaluate_condition(value, condition, message_attributes, criteria):
+                    return True
+    else:
+        for condition in conditions:
+            if evaluate_condition(attribute['Value'], condition, message_attributes, criteria):
+                return True
+
+    return False
+
+
+def check_filter_policy(filter_policy, message_attributes):
+    if not filter_policy:
+        return True
+
+    for criteria in filter_policy:
+        conditions = filter_policy.get(criteria)
+        attribute = message_attributes.get(criteria)
+        if attribute is None:
+            return False
+
+        if evaluate_filter_policy_conditions(conditions, attribute, message_attributes, criteria) is False:
+            return False
+
+    return True
+
+
+def is_raw_message_delivery(susbcriber):
+    return susbcriber.get('RawMessageDelivery') in ('true', True, 'True')
